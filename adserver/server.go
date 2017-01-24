@@ -7,28 +7,65 @@ import (
 	"io"
 	"fmt"
 	"strings"
+	"encoding/json"
 	"time"
-	"io/ioutil"
-	"strconv"
 	"github.com/rs/xid"
-	"github.com/mediocregopher/radix.v2/redis"
-	"github.com/nishantkshyp2004/frontend"
-	"github.com/nishantkshyp2004/bidder"
-	//"github.com/nishantkshyp2004/reducer"
+	"github.com/mediocregopher/radix.v2/pool"
+	"strconv"
+	"errors"
+
 )
 
-//func getredis() redis{
-//
-//	return c
-//}
+type URL struct{
+	Url string
+	State int
+}
 
-func rHandler(w http.ResponseWriter, r *http.Request) {
+type Request struct{
+	Id string
+	Url []URL
+	Response map[string][]string
+	Rstate string
+}
+
+var db *pool.Pool
+
+func init() {
+	var err error
+	// Establish a pool of 10 connections to the Redis server listening on
+	// port 6379 of the local machine.
+	db, err = pool.New("tcp", "localhost:6379", 10)
+	if err != nil {
+		log.Panic(err)
+	}
+}
+
+func rHandler(w http.ResponseWriter, r *http.Request)(string){
+
+
+	if r.Method == "GET" {
+		requestid := r.URL.Query().Get("id")
+		reply, err := db.Cmd("GET", requestid)
+
+		var deserialized Request
+
+		err = json.Unmarshal(reply, &deserialized)
+		if err != nil {
+			panic(err)
+		}
+
+		if deserialized.Rstate == "processing_complete" {
+			return string(deserialized.Response)
+
+		}
+		return string(reply)
+	}
 
 	var requested_url = []string{}
 	mr, err := r.MultipartReader()
 	if err != nil {
 		fmt.Fprintln(w, err)
-		return
+
 	}
 	length := r.ContentLength
 
@@ -66,42 +103,69 @@ func rHandler(w http.ResponseWriter, r *http.Request) {
 	//Generating the Unique ID and setting the response header.
 	guid := xid.New()
 	request_id := guid.String()
-	fmt.Println("UID:",request_id)
+	fmt.Println("UID:", request_id)
+
 	w.Header().Set("req_id", request_id)
 
-	// creating new request object
-	request_struct := frontend.NewRequest(request_id, requested_url)
+	//creating the channel.
+	ch_fb := make(chan string)
+	ch_br := make(chan string)
 
-	//redis connection
-	c, err := redis.Dial("tcp", "localhost:6379")
-	if err != nil {
-		panic("error in connecting Redis server.")
-	}
-
-	defer c.Close()
-	c.Cmd("HSET", "REQUEST", request_id, "")
-
-	frontend_processing(request_struct, requested_url)
-	response_data := bidder_processing(request_struct)
-	reducer_processing(response_data)
-
+	go frontend_processing(request_id, requested_url, ch_fb)
+	go bidder_processing(ch_fb, ch_br)
+	go reducer_processing(ch_br)
+	return "Done"
 }
 
-func frontend_processing(request_struct *frontend.Request, urls []string){
-	//adding url to the request generated
-	for _,url_link := range urls{
-		request_struct.AddUrl(url_link)
+
+func frontend_processing(request_id string, requested_url []string, ch chan string){
+
+	var r Request
+	r.id = request_id
+	r.rstate="frontent_processing"
+	r.url = make([]URL, 0)
+
+	for _,url_val :=range requested_url{
+		url_struct := URL{ url: url_val, }
+		r.url = append( r.url, url_struct)
 	}
+
+	request_struct := &r
+	serialized, err := json.Marshal(request_struct)
+	if err != nil{
+		panic(err)
+	}
+	fmt.Println("serialized data after frontent process: ", string(serialized))
+	// will get the pool connection and put it back to the pool.
+	db.Cmd("SET", request_id, serialized)
+	ch <- request_id
 }
 
 //setting timeout
 var timeout = time.Duration(5 * time.Second)
+var ErrNoRequestId = errors.New("No request id found")
 
-func bidder_processing(request_struct *frontend.Request) []*bidder.BidderRequest{
-	requestid := request_struct.RequestIdReturn()
-	urls_list := request_struct.RequestUrlReturn()
-	responses := []*bidder.BidderRequest{}
-	urls_response_channel := make(chan *bidder.BidderRequest, len(urls_list))
+func bidder_processing(ch_fb chan string, ch_br chan string) {
+
+	requestid := <-ch_fb
+	reply, err :=db.Cmd("GET", requestid)
+
+	// if the request id is not found.
+	if len(reply) == 0{
+		panic(ErrNoRequestId)
+	}else if err != nil{
+			panic(err)
+	}
+
+	var deserialized Request
+
+	err = json.Unmarshal(reply, &deserialized)
+	if err !=nil{
+		panic(err)
+	}
+
+	urls_struct := deserialized.url
+	deserialized.rstate = "bidder_processing"
 
 	//creating custom client to embed the timeout functionality.
 	client := http.Client{
@@ -109,35 +173,99 @@ func bidder_processing(request_struct *frontend.Request) []*bidder.BidderRequest
 	}
 
 	//Using channels and go routine to make the request Async and to collect the response whenever achieved back via channel
-	for _, url :=range urls_list{
-		go func(url string){
+	http_chan := make(chan string)
+	url_count:=1
+	for _, value :=range urls_struct{
+		url := value.url
+		url_count++
+		go func(url string, http_chan chan string){
 			res, err := client.Get(url)
-			body, err := ioutil.ReadAll(res.Body)
 			status_code := strconv.Itoa(res.StatusCode)
-			resp_body := string(body)
-			url_response := bidder.NewUrlResponse(url, status_code, resp_body)
-			urls_response_channel <- bidder.NewBidderRequest(requestid, *url_response)
-		}(url)
+			url_status := url +'@' + status_code
+			http_chan <- url_status
+
+		}(url, http_chan)
 	}
+
 	// Collecting the response back via channel using infinite for-loop and select-case.
+
+	http_response_count :=1
 	for {
-		select {
-			case bidder_request_response := <- urls_response_channel:
-				fmt.Printf("%s response is fetched. ", bidder_request_response.url_response.url)
-				responses = append(responses, bidder_request_response)
-				if len(responses) == len(urls_list){
-					return responses
+		select{
+			case http_response := <- http_chan:
+				fmt.Printf("%s response is fetched. ", http_response)
+				response := strings.Split(http_response, "@")
+
+				//updating the struct with the url`s status code obtained.
+
+				for indx, value := range urls_struct {
+					if value.url == response[0]{
+						deserialized.url[indx].state = response[1]
+						break
+					}
+
 				}
+				//break the infinite loop after all url response is finished.
+				if http_response_count == url_count{
+					break
+				}
+				http_response_count++
 			case <-time.After(50 * time.Millisecond):
 				fmt.Printf(".")
 		}
 	}
 
+	//Serializing the struct again and putting it to the channel
+	serialized, err := json.Marshal(deserialized)
+	fmt.Println("serialized data after bidder process: ", string(serialized))
+	// will get the pool connection and put it back to the pool.
+	db.Cmd("SET", request_id, serialized)
+	ch_br <-requestid
+
 }
 
-func reducer_processing(responses []*bidder.BidderRequest){
-	fmt.Println(responses)
+func reducer_processing(ch_br chan string){
+	requestid := <-ch_br
+	reply, err := db.Cmd("GET", requestid).Map()
+	// if the request id is not found.
+	if len(reply) ==0 {
+		panic(ErrNoRequestId)
+	}else if err != nil{
+		panic(err)
+	}
+
+	var deserialized Request
+	err = json.Unmarshal(reply, &deserialized)
+	if err !=nil{
+		panic(err)
+	}
+
+	deserialized.rstate = "processing_complete"
+
+	var result map[string][]string
+	for indx, value :=range deserialized.url{
+
+		if val, ok :=result[value.state]; !ok{
+			urls :=[]string{}
+			for i:=indx; i<len(deserialized.url)-indx;i++{
+
+				result[value.state] = append(urls, result[value.url])
+			}
+
+		}else{continue }
+	}
+
+
+	deserialized.response = result
+
+	//Serializing the struct again and putting it to the channel
+	serialized, err := json.Marshal(deserialized)
+	fmt.Println("serialized data after bidder process: ", string(serialized))
+	// will get the pool connection and put it back to the pool.
+	db.Cmd("SET", request_id, serialized)
+
 }
+
 
 func main() {
 	r := mux.NewRouter()
