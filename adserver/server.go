@@ -40,25 +40,27 @@ func init() {
 	}
 }
 
-func rHandler(w http.ResponseWriter, r *http.Request)(string){
+func rHandler(w http.ResponseWriter, r *http.Request){
 
 
 	if r.Method == "GET" {
 		requestid := r.URL.Query().Get("id")
-		reply, err := db.Cmd("GET", requestid)
+
+		fmt.Println("Received request id from get request: ", requestid)
+		reply, _ := db.Cmd("GET", requestid).Str()
 
 		var deserialized Request
 
-		err = json.Unmarshal(reply, &deserialized)
-		if err != nil {
-			panic(err)
+		error := json.Unmarshal([]byte(reply), &deserialized)
+		if error != nil {
+			panic(error)
 		}
-
-		if deserialized.Rstate == "processing_complete" {
-			return string(deserialized.Response)
-
+		if deserialized.Rstate =="processing_complete"{
+			data, _ := json.Marshal(deserialized.Response)
+			w.Write([]byte(data))
 		}
-		return string(reply)
+		w.Write([]byte("No response\n"))
+
 	}
 
 	var requested_url = []string{}
@@ -114,20 +116,21 @@ func rHandler(w http.ResponseWriter, r *http.Request)(string){
 	go frontend_processing(request_id, requested_url, ch_fb)
 	go bidder_processing(ch_fb, ch_br)
 	go reducer_processing(ch_br)
-	return "Done"
+	w.Write([]byte("Done"))
+
 }
 
 
 func frontend_processing(request_id string, requested_url []string, ch chan string){
 
 	var r Request
-	r.id = request_id
-	r.rstate="frontent_processing"
-	r.url = make([]URL, 0)
+	r.Id = request_id
+	r.Rstate="frontent_processing"
+	r.Url = make([]URL, 0)
 
 	for _,url_val :=range requested_url{
-		url_struct := URL{ url: url_val, }
-		r.url = append( r.url, url_struct)
+		url_struct := URL{ Url: url_val, }
+		r.Url = append( r.Url, url_struct)
 	}
 
 	request_struct := &r
@@ -148,7 +151,7 @@ var ErrNoRequestId = errors.New("No request id found")
 func bidder_processing(ch_fb chan string, ch_br chan string) {
 
 	requestid := <-ch_fb
-	reply, err :=db.Cmd("GET", requestid)
+	reply, err :=db.Cmd("GET", requestid).Str()
 
 	// if the request id is not found.
 	if len(reply) == 0{
@@ -158,14 +161,13 @@ func bidder_processing(ch_fb chan string, ch_br chan string) {
 	}
 
 	var deserialized Request
-
-	err = json.Unmarshal(reply, &deserialized)
+	err = json.Unmarshal([]byte(reply), &deserialized)
 	if err !=nil{
 		panic(err)
 	}
 
-	urls_struct := deserialized.url
-	deserialized.rstate = "bidder_processing"
+	urls_struct := deserialized.Url
+	deserialized.Rstate = "bidder_processing"
 
 	//creating custom client to embed the timeout functionality.
 	client := http.Client{
@@ -174,14 +176,14 @@ func bidder_processing(ch_fb chan string, ch_br chan string) {
 
 	//Using channels and go routine to make the request Async and to collect the response whenever achieved back via channel
 	http_chan := make(chan string)
-	url_count:=1
+	url_count:=0
 	for _, value :=range urls_struct{
-		url := value.url
+		url := value.Url
 		url_count++
 		go func(url string, http_chan chan string){
-			res, err := client.Get(url)
+			res, _ := client.Get(url)
 			status_code := strconv.Itoa(res.StatusCode)
-			url_status := url +'@' + status_code
+			url_status := url +"@" + status_code
 			http_chan <- url_status
 
 		}(url, http_chan)
@@ -190,7 +192,7 @@ func bidder_processing(ch_fb chan string, ch_br chan string) {
 	// Collecting the response back via channel using infinite for-loop and select-case.
 
 	http_response_count :=1
-	for {
+	for_loop :for {
 		select{
 			case http_response := <- http_chan:
 				fmt.Printf("%s response is fetched. ", http_response)
@@ -199,15 +201,17 @@ func bidder_processing(ch_fb chan string, ch_br chan string) {
 				//updating the struct with the url`s status code obtained.
 
 				for indx, value := range urls_struct {
-					if value.url == response[0]{
-						deserialized.url[indx].state = response[1]
+					if value.Url == response[0]{
+						deserialized.Url[indx].State ,_ = strconv.Atoi(response[1])
 						break
 					}
 
 				}
 				//break the infinite loop after all url response is finished.
+				fmt.Println("http_response_count: ", http_response_count)
+				fmt.Println("url_count: ", url_count)
 				if http_response_count == url_count{
-					break
+					break for_loop
 				}
 				http_response_count++
 			case <-time.After(50 * time.Millisecond):
@@ -219,14 +223,14 @@ func bidder_processing(ch_fb chan string, ch_br chan string) {
 	serialized, err := json.Marshal(deserialized)
 	fmt.Println("serialized data after bidder process: ", string(serialized))
 	// will get the pool connection and put it back to the pool.
-	db.Cmd("SET", request_id, serialized)
+	db.Cmd("SET", requestid, serialized)
 	ch_br <-requestid
 
 }
 
 func reducer_processing(ch_br chan string){
 	requestid := <-ch_br
-	reply, err := db.Cmd("GET", requestid).Map()
+	reply, err := db.Cmd("GET", requestid).Str()
 	// if the request id is not found.
 	if len(reply) ==0 {
 		panic(ErrNoRequestId)
@@ -235,35 +239,35 @@ func reducer_processing(ch_br chan string){
 	}
 
 	var deserialized Request
-	err = json.Unmarshal(reply, &deserialized)
+	err = json.Unmarshal([]byte(reply), &deserialized)
 	if err !=nil{
 		panic(err)
 	}
 
-	deserialized.rstate = "processing_complete"
+	deserialized.Rstate = "processing_complete"
 
-	var result map[string][]string
-	for indx, value :=range deserialized.url{
+	result := make(map[string][]string)
+	for indx, value :=range deserialized.Url{
 
-		if val, ok :=result[value.state]; !ok{
+		if _, ok := result[strconv.Itoa(value.State)]; !ok{
 			urls :=[]string{}
-			for i:=indx; i<len(deserialized.url)-indx;i++{
 
-				result[value.state] = append(urls, result[value.url])
+			for i:=indx; i<= len(deserialized.Url)-1;i++{
+				if value.State == deserialized.Url[i].State{
+					urls = append(urls, deserialized.Url[i].Url)
+				}
 			}
-
-		}else{continue }
+			result[strconv.Itoa(value.State)] = urls
+		}else{continue}
 	}
 
-
-	deserialized.response = result
+	deserialized.Response = result
 
 	//Serializing the struct again and putting it to the channel
 	serialized, err := json.Marshal(deserialized)
-	fmt.Println("serialized data after bidder process: ", string(serialized))
+	fmt.Println("serialized data after reducer process: ", string(serialized))
 	// will get the pool connection and put it back to the pool.
-	db.Cmd("SET", request_id, serialized)
-
+	db.Cmd("SET", requestid, serialized)
 }
 
 
